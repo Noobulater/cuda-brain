@@ -2,6 +2,9 @@
 #include "device_launch_parameters.h"
 
 #include <stdio.h>
+#include <curand.h>
+#include <curand_kernel.h>
+
 #include "SDL.h"
 #undef main
 
@@ -9,18 +12,19 @@ __global__
 void addChange(int *a, int n) {
 	int index = threadIdx.x;
 
+	curandState_t state;
+
+	curand_init(index + a[index], 0, a[index], &state);
+
 	if (index < n) {
-		a[index]++;
-		if (a[index] > 255) {
-			a[index] = 255;
-		}
+		a[index] = curand(&state) % 255;
 	}
 }
 
 int main(int argc, char *args[])
 {
 	// Adds numbers and stuff
-	int SIZE = 10;
+	int SIZE = 170;
 	int *a;
 	int *d_a;
 
@@ -32,12 +36,6 @@ int main(int argc, char *args[])
 	}
 
 	cudaMalloc(&d_a, SIZE*sizeof(int));
-
-	cudaMemcpy(d_a, a, SIZE*sizeof(int), cudaMemcpyHostToDevice);
-
-	addChange<<<1, SIZE>>>(d_a, SIZE);
-
-	cudaMemcpy(a, d_a, SIZE*sizeof(int), cudaMemcpyDeviceToHost);
 
 	int screenWidth = 640;
 	int screenHeight = 480;
@@ -64,13 +62,30 @@ int main(int argc, char *args[])
 				break;
 			}
 		}
+		int square = 40;
+		int width = (screenWidth / square);
+		int height = (screenHeight / square);
+
+		cudaMemcpy(d_a, a, SIZE*sizeof(int), cudaMemcpyHostToDevice);
+
+		addChange << <1, SIZE >> >(d_a, SIZE);
+
+		cudaMemcpy(a, d_a, SIZE*sizeof(int), cudaMemcpyDeviceToHost);
+
 		for (int core = 0; core < SIZE; core++) {
-			for (int i = 0; i < screenWidth / 40; i++) {
-				for (int j = 0; j < screenHeight / 40; j++) {
+			int i = core % width;
+			
+			int j = 0;
+			if (core >= width) {
+				j = core / width;
+			}
+			for (int x = 0; x < square; x++) {
+				for (int y = 0; y < square; y++) {
 					SDL_SetRenderDrawColor(pRender, a[core], 105, 180, 255);
-					SDL_RenderDrawPoint(pRender, core * (screenWidth / 40) + i, j + 40);
+					SDL_RenderDrawPoint(pRender, i * square + x, j * square + y);
 				}
 			}
+
 		}
 		SDL_RenderPresent(pRender);
 	}
