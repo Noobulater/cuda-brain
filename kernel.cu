@@ -6,51 +6,50 @@
 #undef main
 
 __global__
-void saxpy(int n, float a, float *x, float *y)
-{
-	int i = blockIdx.x*blockDim.x + threadIdx.x;
-	if (i < n) y[i] = a*x[i] + y[i];
+void addChange(int *a, int n) {
+	int index = threadIdx.x;
+
+	if (index < n) {
+		a[index]++;
+		if (a[index] > 255) {
+			a[index] = 255;
+		}
+	}
 }
 
 int main(int argc, char *args[])
 {
-	int N = 1 << 20;
-	float *x, *y, *d_x, *d_y;
-	x = (float*)malloc(N*sizeof(float));
-	y = (float*)malloc(N*sizeof(float));
+	// Adds numbers and stuff
+	int SIZE = 10;
+	int *a;
+	int *d_a;
 
-	cudaMalloc(&d_x, N*sizeof(float));
-	cudaMalloc(&d_y, N*sizeof(float));
+	a = (int*)malloc(SIZE*sizeof(int));
 
-	for (int i = 0; i < N; i++) {
-		x[i] = 1.0f;
-		y[i] = 2.0f;
+	//zero a
+	for (int i = 0; i < SIZE; i++) {
+		a[i] = 0;
 	}
 
-	cudaMemcpy(d_x, x, N*sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(d_y, y, N*sizeof(float), cudaMemcpyHostToDevice);
+	cudaMalloc(&d_a, SIZE*sizeof(int));
 
-	// Perform SAXPY on 1M elements
-	saxpy << <(N + 255) / 256, 256 >> >(N, 2.0f, d_x, d_y);
+	cudaMemcpy(d_a, a, SIZE*sizeof(int), cudaMemcpyHostToDevice);
 
-	cudaMemcpy(y, d_y, N*sizeof(float), cudaMemcpyDeviceToHost);
+	addChange<<<1, SIZE>>>(d_a, SIZE);
 
-	float maxError = 0.0f;
-	for (int i = 0; i < N; i++)
-		maxError = max(maxError, abs(y[i] - 4.0f));
-	printf("Max error: %fn", maxError);
+	cudaMemcpy(a, d_a, SIZE*sizeof(int), cudaMemcpyDeviceToHost);
 
+	int screenWidth = 640;
+	int screenHeight = 480;
 
 	SDL_Window* pWindow = NULL;
 	pWindow = SDL_CreateWindow("Brain Cancer Start", SDL_WINDOWPOS_UNDEFINED,
 		SDL_WINDOWPOS_UNDEFINED,
-		640,
-		480,
+		screenWidth,
+		screenHeight,
 		SDL_WINDOW_SHOWN);
 
-	SDL_Surface* pSurface = NULL;
-	pSurface = SDL_GetWindowSurface(pWindow);
-
+	SDL_Renderer* pRender = SDL_CreateRenderer(pWindow, -1, 0);
 
 	SDL_Event evt;
 	bool alive = true;
@@ -65,13 +64,22 @@ int main(int argc, char *args[])
 				break;
 			}
 		}
-		SDL_FillRect(pSurface, NULL, 0xFFF000);
-		SDL_UpdateWindowSurface(pWindow);
+		for (int core = 0; core < SIZE; core++) {
+			for (int i = 0; i < screenWidth / 40; i++) {
+				for (int j = 0; j < screenHeight / 40; j++) {
+					SDL_SetRenderDrawColor(pRender, a[core], 105, 180, 255);
+					SDL_RenderDrawPoint(pRender, core * (screenWidth / 40) + i, j + 40);
+				}
+			}
+		}
+		SDL_RenderPresent(pRender);
 	}
 
-	SDL_FreeSurface(pSurface);
 	SDL_DestroyWindow(pWindow);
 	SDL_Quit();
+
+	free(a);
+	cudaFree(d_a);
 	return 0;
 }
 
