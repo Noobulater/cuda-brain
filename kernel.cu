@@ -37,7 +37,6 @@ void loadOptions() {
 		printf("Loaded N = %d \n", N);
 	}
 
-
 	// Size paramater
 	const char * steps = ini.GetValue("General", "s", "1");
 
@@ -69,52 +68,31 @@ void pullSpecs(int *blocks, int *threads) {
 	}
 }
 
-__global__ void processChunk(char *value, int N, int rp, bool alternate, int seed) {
+__global__ void processChunk(char *value, char* oldFrame, int N, int seed) {
 	//int sIndex = threadIdx.x + blockIdx.x * blockDim.x;
-	int z = blockIdx.x * 2 * rp;
-	if (alternate) {
-		z = z + 1;
+	int bm = N/gridDim.x;
+	int br = N % gridDim.x;
+	
+	if (br > 0 && blockIdx.x < br) {
+		bm = bm + 1;
 	}
-	int sIndex = 0 + 0 * N + (z) * N * N;
-	// start indexs
-	int sX = sIndex % N;
-	int sY = (sIndex / N) % N;
-	int sZ = sIndex / (N * N);
 
 	curandState_t state;
 
 	curand_init(seed, 0, 0, &state);
 
-	for (int i = 0; i < rp; i++) {
+	for (int i = 0; i < bm; i++) {
 		for (int x = 0; x < N; x++) {
 			for (int y = 0; y < N; y++) {
-				int index = x + y * N + (sZ + (i * 2)) * N * N;
-				if (index < N*N*N) { // sanity check
+				int index = x + y * N + (gridDim.x * i + blockIdx.x) * N * N;
+				if (index < N*N*N) { 
+					// sanity check
 					int newValue = curand(&state) % 3;
-					if (value[index] != newValue) {
-						value[index] = newValue;
-					}
-					//value[index] = blockIdx.x + 5;
-				}
-			}
-		}
-	}
-	if (!alternate) {
-		// Initial block assumes the responsibility
-		if (blockIdx.x == gridDim.x - 1 && (N % gridDim.x)) {
-			//Odd number of layers present, 
-			//so we need to assume ONE SINGULAR extra set of data if that is the case
-			//Only the first block needs to assume this extra work
-			for (int x = 0; x < N; x++) {
-				for (int y = 0; y < N; y++) {
-					int index = x + y * N + (N - 1) * N * N;
-					if (index < N*N*N) { // sanity check
-						int newValue = curand(&state) % 3;
-						if (value[index] != newValue) {
-							value[index] = newValue;
-						}
-						//value[index] = blockIdx.x + 5;
-					}
+					//Use old values to determine probablility of mutation
+					//if (value[index] != newValue) {
+					//	value[index] = newValue;
+					//}
+					value[index] = blockIdx.x + 5;
 				}
 			}
 		}
@@ -134,6 +112,7 @@ int main(int argc, char *args[])
 	char *a;
 	char *n_a;
 	char *d_a;
+	char *d_init;
 
 	a = (char*)malloc(SIZE*sizeof(char));
 	n_a = (char*)malloc(SIZE*sizeof(char));
@@ -172,8 +151,10 @@ int main(int argc, char *args[])
 	printf("maxThreadsPerMultiProcessor %d\n", threads);
 
 	cudaMalloc(&d_a, SIZE*sizeof(char));
+	cudaMalloc(&d_init, SIZE*sizeof(char));
 	// have to load initial state, there is no way around it
 	cudaMemcpy(d_a, a, SIZE*sizeof(char), cudaMemcpyHostToDevice); 
+	cudaMemcpy(d_init, a, SIZE*sizeof(char), cudaMemcpyHostToDevice);
 
 	int s = N / 2;
 	// ODD number so it has a remainder
@@ -182,21 +163,15 @@ int main(int argc, char *args[])
 	}
 
 	// Responsibility, #of layers this thread will process
-	int blockCount = min(s, blocks);
-	int rp = (N / 2) / blockCount;
-	if (N % blockCount)
-		rp = rp + 1;
+	int blockCount = blocks;
 
 	printf("%d %d \n", s, blockCount);
 
 	for (int timeStep = 0; timeStep < S; timeStep++) {
-		// Binary Process
 		int seed = rand();
-		processChunk <<<blockCount, 1>>>(d_a, N, rp, false, seed);
+		processChunk <<<blockCount, 1>>>(d_a, d_init, N, seed);
 		cudaDeviceSynchronize(); // Force Kernels to complete
-		//process the second half
-		seed = rand();
-		processChunk <<<blockCount, 1>>>(d_a, N, rp, true, seed);
+
 		cudaDeviceSynchronize(); // Force Kernels to complete
 
 		cudaMemcpy(n_a, d_a, SIZE*sizeof(char), cudaMemcpyDeviceToHost);
@@ -205,8 +180,10 @@ int main(int argc, char *args[])
 			// if healthy, glia = 10, normal = 00, cancer glia = 11, cancer = 01
 			if (a[i] != n_a[i])  {
 				// only record differences, also update a[i]
-				fprintf(c_output, "%d,%d,%d,%d,%d \n", i % N, (i / N) % N, i / (N * N), n_a[i], timeStep);
+				fprintf(c_output, "%d,%d,%d,%d,%d \n", i % N, (i / N) % N, i / (N * N), n_a[i] - 5, timeStep);
 				a[i] = n_a[i];
+				// Send changes back to the GPU
+				cudaMemcpy(&d_init[i], &a[i], sizeof(char), cudaMemcpyHostToDevice);
 			}
 		}
 	}
