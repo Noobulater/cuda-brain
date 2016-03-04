@@ -4,39 +4,176 @@
 #include <stdio.h>
 #include <curand.h>
 #include <curand_kernel.h>
+#include <time.h>
+#include <direct.h>
+#include <math.h>
 
+#include "simpleini\simpleIni.h"
 #include "SDL.h"
+
 #undef main
 
-__global__
-void addChange(int *a, int n) {
-	int index = threadIdx.x;
+FILE* c_output;
+int timeStep;
+__host__ void recordChange(char value) {
+	printf("CHANGED %c \n", value);
+}
 
+__global__ void processChunk(char *value, int n, bool alternate) {
+	int zcoord = blockIdx.x;
+	if (alternate) {
+		if (blockIdx.x == 0 && gridDim.x % 2) {
+			//Odd number of blocks present, 
+			//so we need to assume ONE SINGULAR extra set of data if that is the case
+			//Only the first block needs to assume this extra work
+			//We will assume the last chunk because that block can only expand in teh upward direction
+
+		}
+		zcoord = zcoord + gridDim.x % 2 + 1;
+	}
+	int index = threadIdx.x + blockIdx.x * blockDim.x;
+	
 	curandState_t state;
 
-	curand_init(index + a[index], 0, a[index], &state);
+	curand_init(index, 0, 0, &state);
 
-	if (index < n) {
-		a[index] = curand(&state) % 255;
+	int x = blockIdx.x % n;
+	int y = (blockIdx.x / n) % n;
+	int z = blockIdx.x / (n * n);
+
+	if (index < n*n*n) {
+		int newValue = curand(&state) % 4;
+		/*if (value[index] != newValue) {
+			value[index] = newValue;
+		}*/
+		value[index] = 3;
 	}
 }
 
+int N = 100;
+
+void loadOptions() {
+	// Loads up the config.ini file, and extracts parameters
+	CSimpleIniA ini;
+	ini.SetUnicode();
+	ini.LoadFile("config.ini");
+
+	// Size paramater
+	const char * value = ini.GetValue("General", "n", "0");
+
+	// error checking
+	if (!atoi(value)) {
+		printf("Error Parsing Size, using default value (N = 100) \n");
+	}
+	else {
+		N = atoi(value);
+		printf("Loaded N = %d \n", N);
+	}
+}
+
+void pullSpecs(int *blocks, int *threads) {
+	int deviceCount, device;
+	int gpuDeviceCount = 0;
+	struct cudaDeviceProp properties;
+	cudaError_t cudaResultCode = cudaGetDeviceCount(&deviceCount);
+	if (cudaResultCode != cudaSuccess)
+		deviceCount = 0;
+	for (device = 0; device < deviceCount; ++device) {
+		cudaGetDeviceProperties(&properties, device);
+		if (properties.major != 9999)
+			if (device == 0)
+			{
+				*blocks = properties.multiProcessorCount;
+				*threads = properties.maxThreadsPerMultiProcessor;
+			}
+	}
+}
+
+// EACH CHARACTER POSSIBLY CONTAINS DATA FOR 4 CELLS
+// BYTE IS BROKEN AS FOLLOWS :
+// 00 / 01 / 10 / 11
 int main(int argc, char *args[])
 {
+	// Load Options
+	loadOptions();
+
 	// Adds numbers and stuff
-	int SIZE = 170;
-	int *a;
-	int *d_a;
+	int SIZE = N*N*N; // N^3 Size
+	char *a;
+	char *n_a;
+	char *d_a;
 
-	a = (int*)malloc(SIZE*sizeof(int));
+	a = (char*)malloc(SIZE*sizeof(char));
+	n_a = (char*)malloc(SIZE*sizeof(char));
 
-	//zero a
+	int check = mkdir("outputs");
+
+	char buff[256];
+	sprintf(buff, "outputs/InitState_%d.csv", N);
+
+	FILE* output = fopen(buff, "w");
+	fputs("X,Y,Z,CELLTYPE\n", output);
+	srand(time(NULL));
+	//a contains all value
 	for (int i = 0; i < SIZE; i++) {
-		a[i] = 0;
+		// if healthy, glia = 10, normal = 00, cancer glia = 11, cancer = 01
+		int g = rand() % 2;
+		a[i] = (rand() % 2) * (g+g); // everything starts as a healthy cell
+		// This is where cell structure will be defined
+
+		fprintf(output, "%d,%d,%d,%d \n", i % N, (i / N) % N, i / (N * N), a[i]);
+	}
+	// write the initial state
+	fflush(output);
+	fclose(output);
+	 
+	char c_buff[256];
+	sprintf(c_buff, "outputs/ChangeState_%d.csv", N);
+	c_output = fopen(c_buff, "w");
+
+	fputs("X,Y,Z,CELLTYPE,TIMESTEP\n", c_output);
+
+	timeStep = 0;
+
+	int blocks, threads;
+
+	pullSpecs(&blocks, &threads);
+	printf("multiProcessorCount %d\n", blocks);
+	printf("maxThreadsPerMultiProcessor %d\n", threads);
+
+	cudaMalloc(&d_a, SIZE*sizeof(char));
+	// have to load initial state, there is no way around it
+	cudaMemcpy(d_a, a, SIZE*sizeof(char), cudaMemcpyHostToDevice); 
+
+	int s = N / 2;
+	if (N % 2) // ODD number so it has a remainder
+		printf("ODD \n");
+	printf("%d \n", min(s, blocks));
+	// Binary Process
+	processChunk <<<min(s,blocks), 1>>>(d_a, SIZE, false);
+	cudaDeviceSynchronize(); // Force Kernels to complete
+
+	//processChunk <<<blocks, 1 >>>(d_a, SIZE, true);
+	//cudaDeviceSynchronize(); // Force Kernels to complete
+
+	cudaMemcpy(n_a, d_a, SIZE*sizeof(char), cudaMemcpyDeviceToHost);
+
+	for (int i = 0; i < SIZE; i++) {
+		// if healthy, glia = 10, normal = 00, cancer glia = 11, cancer = 01
+		if (a[i] != n_a[i])  {
+			// only record differences, also update a[i]
+			fprintf(c_output, "%d,%d,%d,%d,%d \n", i % N, (i / N) % N, i / (N * N), n_a[i], timeStep);
+			a[i] = n_a[i];
+		}
 	}
 
-	cudaMalloc(&d_a, SIZE*sizeof(int));
+	fflush(c_output);
+	fclose(c_output);
+		
+	while (true) {
 
+	}
+	/*
 	int screenWidth = 640;
 	int screenHeight = 480;
 
@@ -66,11 +203,11 @@ int main(int argc, char *args[])
 		int width = (screenWidth / square);
 		int height = (screenHeight / square);
 
-		cudaMemcpy(d_a, a, SIZE*sizeof(int), cudaMemcpyHostToDevice);
+		cudaMemcpy(d_a, a, SIZE*sizeof(char), cudaMemcpyHostToDevice);
 
-		addChange << <1, SIZE >> >(d_a, SIZE);
+		//addChange << <1, SIZE >> >(d_a, SIZE);
 
-		cudaMemcpy(a, d_a, SIZE*sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(a, d_a, SIZE*sizeof(char), cudaMemcpyDeviceToHost);
 
 		for (int core = 0; core < SIZE; core++) {
 			int i = core % width;
@@ -92,7 +229,7 @@ int main(int argc, char *args[])
 
 	SDL_DestroyWindow(pWindow);
 	SDL_Quit();
-
+	*/
 	free(a);
 	cudaFree(d_a);
 	return 0;
