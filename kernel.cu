@@ -15,42 +15,9 @@
 
 FILE* c_output;
 int timeStep;
-__host__ void recordChange(char value) {
-	printf("CHANGED %c \n", value);
-}
-
-__global__ void processChunk(char *value, int n, bool alternate) {
-	int zcoord = blockIdx.x;
-	if (alternate) {
-		if (blockIdx.x == 0 && gridDim.x % 2) {
-			//Odd number of blocks present, 
-			//so we need to assume ONE SINGULAR extra set of data if that is the case
-			//Only the first block needs to assume this extra work
-			//We will assume the last chunk because that block can only expand in teh upward direction
-
-		}
-		zcoord = zcoord + gridDim.x % 2 + 1;
-	}
-	int index = threadIdx.x + blockIdx.x * blockDim.x;
-	
-	curandState_t state;
-
-	curand_init(index, 0, 0, &state);
-
-	int x = blockIdx.x % n;
-	int y = (blockIdx.x / n) % n;
-	int z = blockIdx.x / (n * n);
-
-	if (index < n*n*n) {
-		int newValue = curand(&state) % 4;
-		/*if (value[index] != newValue) {
-			value[index] = newValue;
-		}*/
-		value[index] = 3;
-	}
-}
 
 int N = 100;
+int S = 1; // STEPS
 
 void loadOptions() {
 	// Loads up the config.ini file, and extracts parameters
@@ -69,6 +36,19 @@ void loadOptions() {
 		N = atoi(value);
 		printf("Loaded N = %d \n", N);
 	}
+
+
+	// Size paramater
+	const char * steps = ini.GetValue("General", "s", "1");
+
+	// error checking
+	if (!atoi(steps)) {
+		printf("Error Parsing Steps, using default value (S = 1) \n");
+	}
+	else {
+		S = atoi(steps);
+		printf("Loaded timeSteps = %d \n", S);
+	}
 }
 
 void pullSpecs(int *blocks, int *threads) {
@@ -86,6 +66,58 @@ void pullSpecs(int *blocks, int *threads) {
 				*blocks = properties.multiProcessorCount;
 				*threads = properties.maxThreadsPerMultiProcessor;
 			}
+	}
+}
+
+__global__ void processChunk(char *value, int N, int rp, bool alternate, int seed) {
+	//int sIndex = threadIdx.x + blockIdx.x * blockDim.x;
+	int z = blockIdx.x * 2 * rp;
+	if (alternate) {
+		z = z + 1;
+	}
+	int sIndex = 0 + 0 * N + (z) * N * N;
+	// start indexs
+	int sX = sIndex % N;
+	int sY = (sIndex / N) % N;
+	int sZ = sIndex / (N * N);
+
+	curandState_t state;
+
+	curand_init(seed, 0, 0, &state);
+
+	for (int i = 0; i < rp; i++) {
+		for (int x = 0; x < N; x++) {
+			for (int y = 0; y < N; y++) {
+				int index = x + y * N + (sZ + (i * 2)) * N * N;
+				if (index < N*N*N) { // sanity check
+					int newValue = curand(&state) % 3;
+					if (value[index] != newValue) {
+						value[index] = newValue;
+					}
+					//value[index] = blockIdx.x + 5;
+				}
+			}
+		}
+	}
+	if (!alternate) {
+		// Initial block assumes the responsibility
+		if (blockIdx.x == gridDim.x - 1 && (N % gridDim.x)) {
+			//Odd number of layers present, 
+			//so we need to assume ONE SINGULAR extra set of data if that is the case
+			//Only the first block needs to assume this extra work
+			for (int x = 0; x < N; x++) {
+				for (int y = 0; y < N; y++) {
+					int index = x + y * N + (N - 1) * N * N;
+					if (index < N*N*N) { // sanity check
+						int newValue = curand(&state) % 3;
+						if (value[index] != newValue) {
+							value[index] = newValue;
+						}
+						//value[index] = blockIdx.x + 5;
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -133,8 +165,6 @@ int main(int argc, char *args[])
 
 	fputs("X,Y,Z,CELLTYPE,TIMESTEP\n", c_output);
 
-	timeStep = 0;
-
 	int blocks, threads;
 
 	pullSpecs(&blocks, &threads);
@@ -146,24 +176,38 @@ int main(int argc, char *args[])
 	cudaMemcpy(d_a, a, SIZE*sizeof(char), cudaMemcpyHostToDevice); 
 
 	int s = N / 2;
-	if (N % 2) // ODD number so it has a remainder
-		printf("ODD \n");
-	printf("%d \n", min(s, blocks));
-	// Binary Process
-	processChunk <<<min(s,blocks), 1>>>(d_a, SIZE, false);
-	cudaDeviceSynchronize(); // Force Kernels to complete
+	// ODD number so it has a remainder
+	if (N % 2) { 
+		s = s + 1;
+	}
 
-	//processChunk <<<blocks, 1 >>>(d_a, SIZE, true);
-	//cudaDeviceSynchronize(); // Force Kernels to complete
+	// Responsibility, #of layers this thread will process
+	int blockCount = min(s, blocks);
+	int rp = (N / 2) / blockCount;
+	if (N % blockCount)
+		rp = rp + 1;
 
-	cudaMemcpy(n_a, d_a, SIZE*sizeof(char), cudaMemcpyDeviceToHost);
+	printf("%d %d \n", s, blockCount);
 
-	for (int i = 0; i < SIZE; i++) {
-		// if healthy, glia = 10, normal = 00, cancer glia = 11, cancer = 01
-		if (a[i] != n_a[i])  {
-			// only record differences, also update a[i]
-			fprintf(c_output, "%d,%d,%d,%d,%d \n", i % N, (i / N) % N, i / (N * N), n_a[i], timeStep);
-			a[i] = n_a[i];
+	for (int timeStep = 0; timeStep < S; timeStep++) {
+		// Binary Process
+		int seed = rand();
+		processChunk <<<blockCount, 1>>>(d_a, N, rp, false, seed);
+		cudaDeviceSynchronize(); // Force Kernels to complete
+		//process the second half
+		seed = rand();
+		processChunk <<<blockCount, 1>>>(d_a, N, rp, true, seed);
+		cudaDeviceSynchronize(); // Force Kernels to complete
+
+		cudaMemcpy(n_a, d_a, SIZE*sizeof(char), cudaMemcpyDeviceToHost);
+
+		for (int i = 0; i < SIZE; i++) {
+			// if healthy, glia = 10, normal = 00, cancer glia = 11, cancer = 01
+			if (a[i] != n_a[i])  {
+				// only record differences, also update a[i]
+				fprintf(c_output, "%d,%d,%d,%d,%d \n", i % N, (i / N) % N, i / (N * N), n_a[i], timeStep);
+				a[i] = n_a[i];
+			}
 		}
 	}
 
